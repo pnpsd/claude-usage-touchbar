@@ -30,6 +30,10 @@ extern void DFRSystemModalShowsCloseBoxWhenFrontMost(BOOL show);
 static NSTouchBarItemIdentifier const kSceneID = @"local.claude-touchbar.scene";
 static NSTouchBarItemIdentifier const kEscID   = @"local.claude-touchbar.esc";
 static NSString *const kScript = @"~/bin/claude-touchbar.sh --raw";
+// The bar only shows while one of these apps is frontmost.
+static NSArray<NSString *> *ShowForBundleIDs(void) {
+    return @[@"com.anthropic.claudefordesktop"];
+}
 
 // Measured with `make ruler`, which draws ticks at fixed coordinates: the last
 // legible label is 600, so that is the usable width beside the Control Strip.
@@ -796,7 +800,7 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
 @property (nonatomic, strong) id activity;
 @property (nonatomic) NSTimeInterval lastFrame;
 @property (nonatomic) NSTimeInterval lastPoll;
-@property (nonatomic) BOOL polling, asleep;
+@property (nonatomic) BOOL polling, asleep, shown;
 @end
 
 @implementation AppDelegate
@@ -831,7 +835,7 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
     // Keep Esc working — a presented bar otherwise covers the system one.
     self.bar.escapeKeyReplacementItemIdentifier = kEscID;
 
-    [self present];
+    [self syncToFrontApp];
 
     // App Nap will freeze the animation the moment you switch away, which is
     // precisely when the pet is worth watching.
@@ -844,10 +848,11 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
     // .common mode: default-mode timers stall inside menu/tracking loops.
     [NSRunLoop.mainRunLoop addTimer:self.frameTimer forMode:NSRunLoopCommonModes];
 
-    // A presented bar yields when another app presents its own, so re-assert on
-    // every app switch. Cheap and idempotent.
+    // Show the bar while Claude is frontmost and hide it otherwise. Showing
+    // again on every switch to Claude also takes the bar back if another app
+    // has presented its own.
     [NSWorkspace.sharedWorkspace.notificationCenter
-        addObserver:self selector:@selector(present)
+        addObserver:self selector:@selector(syncToFrontApp)
                name:NSWorkspaceDidActivateApplicationNotification object:nil];
 
     // Don't animate into a locked screen.
@@ -863,8 +868,19 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
     [NSTouchBar presentSystemModalTouchBar:self.bar placement:0 systemTrayItemIdentifier:nil];
 }
 
+- (void)syncToFrontApp {
+    NSString *front = NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier;
+    if (front && [ShowForBundleIDs() containsObject:front]) {
+        self.shown = YES;
+        [self present];
+    } else if (self.shown) {
+        self.shown = NO;
+        [NSTouchBar dismissSystemModalTouchBar:self.bar];
+    }
+}
+
 - (void)sleep { self.asleep = YES; }
-- (void)wake  { self.asleep = NO; [self present]; }
+- (void)wake  { self.asleep = NO; [self syncToFrontApp]; }
 
 - (nullable NSTouchBarItem *)touchBar:(NSTouchBar *)bar
                 makeItemForIdentifier:(NSTouchBarItemIdentifier)identifier {
@@ -905,7 +921,7 @@ static void DrawDrop(CGFloat x, CGFloat y, CGFloat scale, NSColor *c, CGFloat al
     NSTimeInterval dt = MIN(now - self.lastFrame, 0.25);   // clamp after a stall
     self.lastFrame = now;
 
-    [self.pet advance:dt];
+    if (self.shown) [self.pet advance:dt];
 
     if (now - self.lastPoll >= 30.0) { self.lastPoll = now; [self poll]; }
 }

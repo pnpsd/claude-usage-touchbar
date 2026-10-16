@@ -31,19 +31,48 @@ read_cache() {                          # -> P5 P7 RESET SP SN STAMP
   [ -n "${P5:-}" ]
 }
 
+# An expired token is renewed the same way a person would: one tiny `claude -p`
+# call, which makes the CLI refresh its own credentials. Throttled to once per
+# REFRESH_EVERY seconds so a broken login cannot spend usage in a loop, and
+# killed after 60s so a hung CLI cannot stall the widget's polling.
+REFRESH_STAMP=/tmp/.claude-usage-refresh-$UID
+REFRESH_EVERY=600
+
+refresh_token() {
+  local now last=0 cli pid watcher
+  now=$(date +%s)
+  [ -f "$REFRESH_STAMP" ] && read -r last < "$REFRESH_STAMP" 2>/dev/null
+  [ $(( now - ${last:-0} )) -ge "$REFRESH_EVERY" ] || return 1
+  printf '%s\n' "$now" > "$REFRESH_STAMP"
+  cli=$(command -v claude 2>/dev/null) || cli="$HOME/.local/bin/claude"
+  [ -x "$cli" ] || return 1
+  "$cli" -p hi --model haiku >/dev/null 2>&1 </dev/null &
+  pid=$!
+  ( sleep 60; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  watcher=$!
+  wait "$pid"; local rc=$?
+  kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null
+  return $rc
+}
+
 P5=; P7=; RESET=-1; SP=-1; SN=-; STAMP=0
 read_cache || :
 AGE=$(( $(date +%s) - ${STAMP:-0} ))
 
 state=ok
 if [ "${STAMP:-0}" -eq 0 ] || [ "$AGE" -ge "$TTL" ]; then
-  cred=$(security find-generic-password -s 'Claude Code-credentials' -a "$USER" -w 2>/dev/null)
-
-  # Check expiry locally first: it tells us *why* we failed instead of guessing
-  # from an HTTP code, and saves a round trip on a token that cannot work.
-  expired=$(printf '%s' "$cred" | "$PY" -c 'import json,sys,time
+  read_cred() {
+    cred=$(security find-generic-password -s 'Claude Code-credentials' -a "$USER" -w 2>/dev/null)
+    # Check expiry locally first: it tells us *why* we failed instead of guessing
+    # from an HTTP code, and saves a round trip on a token that cannot work.
+    expired=$(printf '%s' "$cred" | "$PY" -c 'import json,sys,time
 try: print("1" if json.load(sys.stdin)["claudeAiOauth"]["expiresAt"] < time.time()*1000 else "0")
 except Exception: print("1")')
+  }
+  read_cred
+  if [ "$expired" = "1" ] && refresh_token; then
+    read_cred
+  fi
 
   if [ "$expired" = "1" ]; then
     state=expired
